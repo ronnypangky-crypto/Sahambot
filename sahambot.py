@@ -22,6 +22,7 @@ DEFAULT_WATCHLIST = [
     "MITI", "MICE", "WIRG", "TINS", "ANTM",
     "WIKA", "ADHI", "PTPP", "WSKT", "MDKA",
     "INCO", "VALE", "SMCB", "BSDE", "LPKR",
+    "IATA", "SMLE", "TLKM", "BBCA",
 ]
 
 # ── State ───────────────────────────────────────────────
