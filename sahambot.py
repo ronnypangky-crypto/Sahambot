@@ -6,7 +6,7 @@ TG_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO  = os.environ.get("GITHUB_REPO", "")
-GITHUB_FILE  = "saham_data.json"
+GITHUB_FILE  = os.environ.get("GITHUB_FILE", "saham_data.json")
 
 WIB = timezone(timedelta(hours=7))
 
@@ -15,6 +15,13 @@ MIN_HARGA    = float(os.environ.get("MIN_HARGA",    "50"))    # min harga saham
 MAX_HARGA    = float(os.environ.get("MAX_HARGA",    "500"))   # max harga saham
 MIN_SINYAL   = int(os.environ.get("MIN_SINYAL",    "3"))      # min sinyal untuk alert
 SCAN_MENIT   = int(os.environ.get("SCAN_MENIT",    "30"))     # scan tiap X menit
+
+# Filter breakout (opsional, dari screener Stockbit)
+FILTER_BREAKOUT = os.environ.get("FILTER_BREAKOUT", "0") == "1"
+BBW_MAX      = float(os.environ.get("BBW_MAX",      "10"))          # bandwidth Bollinger maksimum (%)
+MIN_VALUE    = float(os.environ.get("MIN_VALUE",    "1000000000"))  # nilai transaksi minimum (Rp)
+RSI_MIN      = float(os.environ.get("RSI_MIN",      "45"))
+RSI_MAX      = float(os.environ.get("RSI_MAX",      "60"))
 
 # Default watchlist — saham gocap aktif
 DEFAULT_WATCHLIST = [
@@ -28,6 +35,7 @@ DEFAULT_WATCHLIST = [
 # ── State ───────────────────────────────────────────────
 last_update_id = 0
 alerted_today  = set()
+pos_alerted    = set()
 data = {
     "watchlist": [],
     "posisi": {}
@@ -59,7 +67,8 @@ def send_telegram(msg):
 def load_data():
     global data
     if not GITHUB_TOKEN or not GITHUB_REPO:
-        log("⚠️ GitHub tidak dikonfigurasi!")
+        log("⚠️ GitHub tidak dikonfigurasi — pakai default watchlist (data tidak tersimpan permanen)")
+        data["watchlist"] = DEFAULT_WATCHLIST.copy()
         return
     try:
         r = requests.get(
@@ -70,6 +79,8 @@ def load_data():
         if r.status_code == 200:
             content = base64.b64decode(r.json()["content"]).decode("utf-8")
             data = json.loads(content)
+            data.setdefault("watchlist", [])
+            data.setdefault("posisi", {})
             log(f"✅ Data loaded — {len(data['watchlist'])} saham dipantau")
             # Tambah default watchlist kalau masih kosong
             if not data["watchlist"]:
@@ -99,12 +110,16 @@ def save_data():
         payload = {"message": f"Update saham {now_str()}", "content": content}
         if sha:
             payload["sha"] = sha
-        requests.put(
+        resp = requests.put(
             f"https://api.github.com/repos/{GITHUB_REPO}/contents/{GITHUB_FILE}",
             headers={"Authorization": f"token {GITHUB_TOKEN}"},
             json=payload, timeout=15
         )
-        log("✅ Data tersimpan ke GitHub!")
+        if resp.status_code in (200, 201):
+            log("✅ Data tersimpan ke GitHub!")
+        else:
+            log(f"⚠️ Gagal simpan ke GitHub: {resp.status_code} {resp.text[:120]}")
+            send_telegram(f"⚠️ *Data gagal tersimpan ke GitHub* (kode {resp.status_code}). Cek token dan nama repo di Railway Variables!")
     except Exception as e:
         log(f"⚠️ Gagal save: {e}")
 
@@ -113,7 +128,7 @@ def get_stock_data(ticker):
     try:
         symbol = f"{ticker}.JK"
         url    = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-        r = requests.get(url, params={"interval": "1d", "range": "30d"},
+        r = requests.get(url, params={"interval": "1d", "range": "3mo"},
                         headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         result = r.json().get("chart", {}).get("result", [])
         if not result:
@@ -152,10 +167,20 @@ def calc_ema(prices, period):
     for p in prices[1:]: ema = p*k + ema*(1-k)
     return ema
 
+def calc_bbw(prices, period=20):
+    """Bollinger bandwidth (%) = (upper - lower) / middle * 100, std 2"""
+    if len(prices) < period: return 999
+    sl  = prices[-period:]
+    mid = sum(sl) / period
+    if mid == 0: return 999
+    std = (sum((x - mid) ** 2 for x in sl) / period) ** 0.5
+    return (4 * std) / mid * 100
+
 def calc_macd(prices):
-    if len(prices) < 26: return 0, 0
-    macd = calc_ema(prices, 12) - calc_ema(prices, 26)
-    return macd, calc_ema([macd], 9)
+    if len(prices) < 34: return 0, 0
+    macd_series = [calc_ema(prices[:i], 12) - calc_ema(prices[:i], 26)
+                   for i in range(26, len(prices) + 1)]
+    return macd_series[-1], calc_ema(macd_series, 9)
 
 # ── Fetch Berita ────────────────────────────────────────
 def get_berita(ticker):
@@ -225,12 +250,33 @@ def analisa(ticker):
     if macd > sig:   sinyal += 1; reasons.append("MACD✅")
     if chg_pct > 0:  sinyal += 1; reasons.append(f"+{chg_pct:.1f}%✅")
 
+    bbw      = calc_bbw(closes)
+    ema5     = calc_ema(closes, 5)
+    vol_ema5 = calc_ema(volumes, 5)
+    value    = price * volume
+    reasons.append(f"BBW={bbw:.1f}% | Value {fmt(value)}")
+
     return {
+        "bbw": bbw, "value": value, "ema5": ema5,
+        "vol_ema5": vol_ema5, "volume": volume,
         "ticker": ticker, "price": price, "chg_pct": chg_pct,
         "vol_ratio": vol_ratio, "rsi": rsi,
         "ema9": ema9, "ema21": ema21,
         "sinyal": sinyal, "reasons": reasons,
     }
+
+def lolos_breakout(r):
+    return (r["bbw"] < BBW_MAX and r["value"] > MIN_VALUE
+            and r["price"] > r["ema5"] and r["volume"] > r["vol_ema5"]
+            and RSI_MIN < r["rsi"] < RSI_MAX)
+
+def lolos_scan(r):
+    """Kandidat lolos? Kalau FILTER_BREAKOUT aktif, screener menggantikan MIN_SINYAL."""
+    if not r: return False
+    if not (MIN_HARGA <= r["price"] <= MAX_HARGA): return False
+    if FILTER_BREAKOUT:
+        return lolos_breakout(r)
+    return r["sinyal"] >= MIN_SINYAL
 
 def send_signal(result, label="📊 SIGNAL"):
     ticker    = result["ticker"]
@@ -281,14 +327,16 @@ def cek_posisi():
         emoji     = "🟢" if pl_pct >= 0 else "🔴"
 
         # Notif kalau profit >= 8% atau loss >= 5%
-        if pl_pct >= 8:
+        if pl_pct >= 8 and "TP:" + ticker not in pos_alerted:
+            pos_alerted.add("TP:" + ticker)
             send_telegram(
                 f"🎯 *TARGET PROFIT: {ticker}*\n"
                 f"💰 Harga: {fmt(curr)}\n"
                 f"🟢 P/L: +{pl_pct:.1f}% (+{fmt(pl_idr)})\n"
                 f"Pertimbangkan untuk jual! 😄"
             )
-        elif pl_pct <= -5:
+        elif pl_pct <= -5 and "SL:" + ticker not in pos_alerted:
+            pos_alerted.add("SL:" + ticker)
             send_telegram(
                 f"🛑 *STOP LOSS: {ticker}*\n"
                 f"💰 Harga: {fmt(curr)}\n"
@@ -307,8 +355,12 @@ def get_idx_tickers():
             headers={"User-Agent": "Mozilla/5.0"}, timeout=10
         )
         quotes = r.json().get("finance", {}).get("result", [{}])[0].get("quotes", [])
-        return [q["symbol"].replace(".JK","") for q in quotes if q.get("symbol","").endswith(".JK")]
-    except:
+        hasil = [q["symbol"].replace(".JK","") for q in quotes if q.get("symbol","").endswith(".JK")]
+        if not hasil:
+            log("⚠️ Screener Yahoo kosong — scan hanya watchlist")
+        return hasil
+    except Exception as e:
+        log(f"⚠️ Screener Yahoo gagal: {e} — scan hanya watchlist")
         return []
 
 def scan_idx_gocap():
@@ -327,7 +379,7 @@ def scan_idx_gocap():
     candidates = []
     for i, ticker in enumerate(all_tickers):
         result = analisa(ticker)
-        if result and result["sinyal"] >= MIN_SINYAL:
+        if lolos_scan(result):
             candidates.append(result)
         if i % 20 == 0:
             log(f"📊 Checked {i}/{len(all_tickers)}...")
@@ -370,7 +422,7 @@ def scan_watchlist():
     candidates = []
     for ticker in data["watchlist"]:
         result = analisa(ticker)
-        if result and result["sinyal"] >= MIN_SINYAL:
+        if lolos_scan(result):
             candidates.append(result)
         time.sleep(0.5)
 
@@ -465,12 +517,14 @@ def handle_command(text):
             "harga_beli": harga_beli,
             "waktu":      now_str()
         }
+        pos_alerted.discard("TP:" + ticker)
+        pos_alerted.discard("SL:" + ticker)
         save_data()
         qty = modal / harga_beli
         send_telegram(
             f"✅ *Posisi {ticker} dicatat!*\n"
             f"💰 Harga beli: {fmt(harga_beli)}\n"
-            f"📦 Qty estimasi: {qty:.0f} lot\n"
+            f"📦 Estimasi: {qty:.0f} lembar (~{qty/100:.0f} lot)\n"
             f"💵 Modal: {fmt(modal)}\n"
             f"🎯 Target: {fmt(harga_beli * 1.08)} (+8%)\n"
             f"🛑 Stop Loss: {fmt(harga_beli * 0.95)} (-5%)"
@@ -492,6 +546,8 @@ def handle_command(text):
         pl_idr = (curr - pos["harga_beli"]) * (pos["modal"] / pos["harga_beli"])
         emoji  = "🟢" if pl_pct >= 0 else "🔴"
         del data["posisi"][ticker]
+        pos_alerted.discard("TP:" + ticker)
+        pos_alerted.discard("SL:" + ticker)
         save_data()
         send_telegram(
             f"✅ *Posisi {ticker} ditutup!*\n"
@@ -582,6 +638,7 @@ def handle_command(text):
             f"/posisi — lihat semua posisi\n"
             f"/cek TICKER — analisa 1 saham\n"
             f"/scan — scan watchlist sekarang\n"
+            f"/config — lihat settings\n"
             f"/watchlist — lihat watchlist"
         )
 
@@ -592,11 +649,12 @@ def handle_command(text):
             f"💰 Harga min: {fmt(MIN_HARGA)}\n"
             f"💰 Harga max: {fmt(MAX_HARGA)}\n"
             f"📊 Min sinyal: {MIN_SINYAL}\n"
-            f"⏱️ Scan tiap: {SCAN_MENIT} menit\n\n"
+            f"⏱️ Scan tiap: {SCAN_MENIT} menit\n"
+            f"🔎 Filter breakout: {'AKTIF' if FILTER_BREAKOUT else 'MATI'} (BBW<{BBW_MAX:.0f}, value>{fmt(MIN_VALUE)}, RSI {RSI_MIN:.0f}-{RSI_MAX:.0f})\n\n"
             f"*Edit via Railway Variables:*\n"
             f"`MIN_HARGA` — harga minimum saham\n"
             f"`MAX_HARGA` — harga maximum saham\n"
-            f"`MIN_SINYAL` — minimum sinyal (1-5)\n"
+            f"`MIN_SINYAL` — minimum sinyal (1-8)\n"
             f"`SCAN_MENIT` — interval scan (menit)"
         )
 
@@ -665,7 +723,6 @@ def main():
             # Scan & cek posisi setiap SCAN_MENIT menit
             if tick % (SCAN_MENIT * 60 // 5) == 0:
                 scan_idx_gocap()
-                scan_watchlist()
                 cek_posisi()
             tick += 1
             time.sleep(5)
