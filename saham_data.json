@@ -21,11 +21,5 @@
     "BSDE",
     "LPKR"
   ],
-  "posisi": {
-    "ANDI": {
-      "modal": 34.0,
-      "harga_beli": 35.0,
-      "waktu": "28/10/2026 09:52"
-    }
-  }
+  "posisi": {}
 }
