@@ -26,5 +26,11 @@
     "DSFI",
     "PGLI"
   ],
-  "posisi": {}
+  "posisi": {
+    "ANDI": {
+      "modal": 35052.0,
+      "harga_beli": 35.0,
+      "waktu": "28/10/2026 10:03"
+    }
+  }
 }
