@@ -34,11 +34,5 @@
     "BAJA",
     "DOOH"
   ],
-  "posisi": {
-    "TGUK": {
-      "modal": 9400.0,
-      "harga_beli": 93.0,
-      "waktu": "28/10/2026 10:05"
-    }
-  }
+  "posisi": {}
 }
